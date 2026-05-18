@@ -1,0 +1,1032 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Project Sabbath :: Secure Terminal</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; background: #000; color: #00ff46; font-family: 'Courier New', Courier, monospace; overflow-x: hidden; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+@keyframes fadeIn { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+.scanlines { position:fixed;inset:0;pointer-events:none;z-index:9999;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,255,70,0.012) 2px,rgba(0,255,70,0.012) 4px); }
+.vignette { position:fixed;inset:0;pointer-events:none;z-index:9998;background:radial-gradient(ellipse at center,transparent 55%,rgba(0,0,0,0.75) 100%); }
+input, button { font-family:'Courier New', Courier, monospace; }
+input::placeholder { color:rgba(0,255,70,0.3); }
+::-webkit-scrollbar { width:4px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:rgba(0,255,70,0.25); }
+</style>
+</head>
+<body>
+<div class="scanlines"></div>
+<div class="vignette"></div>
+<div id="root"></div>
+
+<!-- Supabase JS CDN -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+<script>
+// ═══════════════════════════════════════════════
+// SUPABASE CONFIG
+// ═══════════════════════════════════════════════
+const SUPA_URL  = "https://azbrmdbmovisqtjujnbb.supabase.co";
+const SUPA_KEY  = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF6YnJtZGJtb3Zpc3F0anVqbmJiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkwMzY3OTcsImV4cCI6MjA5NDYxMjc5N30.sfYNm7owcSZZ1T-ZU9LwrcdIr2HhX2ym7Md9px9oobs";
+const db = supabase.createClient(SUPA_URL, SUPA_KEY);
+
+// ═══════════════════════════════════════════════
+// CONSTANTS
+// ═══════════════════════════════════════════════
+const ADMIN_USER  = "omega";
+const ADMIN_PASS  = "sabbath_admin";
+const SESSION_ID  = "main";           // single game session key
+const GLITCH_CHARS = "!@#$%^&*()<>?/|{}[]~ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+// ═══════════════════════════════════════════════
+// LOCAL STATE  (always synced FROM Supabase)
+// ═══════════════════════════════════════════════
+const state = {
+  screen:     "boot",
+  loggedTeam: null,
+  isAdmin:    false,
+  teams:      [],         // loaded from DB
+  phase:      "waiting",  // waiting | final | shutdown
+  termLog:    [],
+  submitted:  false,
+  _broadcastShown: false,
+  _dbReady:   false,
+};
+
+// ═══════════════════════════════════════════════
+// UTILS
+// ═══════════════════════════════════════════════
+function glitch(text, intensity) {
+  return text.split("").map(c =>
+    Math.random() < intensity ? GLITCH_CHARS[Math.floor(Math.random()*GLITCH_CHARS.length)] : c
+  ).join("");
+}
+function div(styles) {
+  const d = document.createElement("div");
+  if (styles) Object.assign(d.style, styles);
+  return d;
+}
+function go(screen) { state.screen = screen; render(); }
+
+// ═══════════════════════════════════════════════
+// SOUND ENGINE
+// ═══════════════════════════════════════════════
+const SFX = (() => {
+  let ctx = null;
+  const getCtx = () => { if (!ctx) ctx = new (window.AudioContext||window.webkitAudioContext)(); return ctx; };
+  function tone(freq,type,duration,vol,startTime,fadeOut){
+    try{const ac=getCtx();const osc=ac.createOscillator();const gain=ac.createGain();
+    osc.connect(gain);gain.connect(ac.destination);osc.type=type||"square";
+    osc.frequency.setValueAtTime(freq,startTime);gain.gain.setValueAtTime(vol||0.12,startTime);
+    if(fadeOut)gain.gain.exponentialRampToValueAtTime(0.0001,startTime+duration);
+    osc.start(startTime);osc.stop(startTime+duration);}catch(e){}
+  }
+  function noise(duration,vol,startTime){
+    try{const ac=getCtx();const bufSize=ac.sampleRate*duration;const buf=ac.createBuffer(1,bufSize,ac.sampleRate);
+    const data=buf.getChannelData(0);for(let i=0;i<bufSize;i++)data[i]=Math.random()*2-1;
+    const src=ac.createBufferSource();const gain=ac.createGain();const filter=ac.createBiquadFilter();
+    filter.type="bandpass";filter.frequency.value=1200;filter.Q.value=0.5;
+    src.buffer=buf;src.connect(filter);filter.connect(gain);gain.connect(ac.destination);
+    gain.gain.setValueAtTime(vol||0.08,startTime);gain.gain.exponentialRampToValueAtTime(0.0001,startTime+duration);
+    src.start(startTime);src.stop(startTime+duration+0.01);}catch(e){}
+  }
+  return {
+    keyclick(){ try{const ac=getCtx(),t=ac.currentTime;noise(0.025,0.04,t);tone(800+Math.random()*400,"square",0.018,0.03,t,true);}catch(e){} },
+    lineDone(){ try{const ac=getCtx(),t=ac.currentTime;noise(0.04,0.07,t);tone(300,"sawtooth",0.06,0.05,t,true);}catch(e){} },
+    accept(){ try{const ac=getCtx(),t=ac.currentTime;tone(880,"sine",0.08,0.15,t,true);tone(1320,"sine",0.08,0.10,t+0.09,true);}catch(e){} },
+    reject(){ try{const ac=getCtx(),t=ac.currentTime;tone(120,"sawtooth",0.18,0.18,t,true);noise(0.18,0.10,t);}catch(e){} },
+    loginOk(){ try{const ac=getCtx(),t=ac.currentTime;[440,554,659].forEach((f,i)=>tone(f,"sine",0.12,0.12,t+i*0.08,true));}catch(e){} },
+    loginFail(){ try{const ac=getCtx(),t=ac.currentTime;tone(80,"sawtooth",0.3,0.2,t,true);noise(0.3,0.12,t);}catch(e){} },
+    alarm(){ try{const ac=getCtx();let t=ac.currentTime;for(let i=0;i<6;i++){tone(880,"sawtooth",0.18,0.13,t,true);tone(660,"sawtooth",0.18,0.10,t+0.20,true);t+=0.40;}}catch(e){} },
+    glitchBurst(){ try{const ac=getCtx(),t=ac.currentTime;noise(0.06,0.15,t);tone(Math.random()*800+200,"sawtooth",0.05,0.10,t,true);}catch(e){} },
+    thud(){ try{const ac=getCtx(),t=ac.currentTime;tone(55,"sine",0.6,0.4,t,true);noise(0.3,0.2,t);}catch(e){} },
+    victory(){ try{const ac=getCtx(),t=ac.currentTime;[220,277,330,440,554,659,880].forEach((f,i)=>tone(f,"sine",0.4,0.10,t+i*0.12,true));}catch(e){} },
+    ping(){ try{const ac=getCtx(),t=ac.currentTime;tone(1200,"sine",0.06,0.06,t,true);}catch(e){} },
+  };
+})();
+
+// ═══════════════════════════════════════════════
+// SUPABASE DB LAYER
+// ═══════════════════════════════════════════════
+
+// Load all teams from DB into state.teams
+async function dbLoadTeams() {
+  const { data, error } = await db.from("teams").select("*").order("sort_order");
+  if (error) { console.error("dbLoadTeams:", error); return; }
+  state.teams = data.map(r => ({
+    id:        r.id,
+    name:      r.name,
+    password:  r.password,
+    fragment:  r.fragment,
+    completed: r.completed,
+    sort_order: r.sort_order,
+  }));
+}
+
+// Load game session (phase) from DB
+async function dbLoadSession() {
+  const { data, error } = await db.from("game_session").select("*").eq("id", SESSION_ID).single();
+  if (error) { console.error("dbLoadSession:", error); return; }
+  if (data) state.phase = data.phase;
+}
+
+// Mark a team complete in DB
+async function dbCompleteTeam(teamId) {
+  const { error } = await db.from("teams").update({ completed: true }).eq("id", teamId);
+  if (error) console.error("dbCompleteTeam:", error);
+}
+
+// Update game phase in DB
+async function dbSetPhase(phase) {
+  const { error } = await db.from("game_session").update({ phase }).eq("id", SESSION_ID);
+  if (error) console.error("dbSetPhase:", error);
+}
+
+// Save full team roster from admin editor
+async function dbSaveTeams() {
+  // upsert all teams
+  const rows = state.teams.map((t, i) => ({
+    id:         t.id,
+    name:       t.name,
+    password:   t.password,
+    fragment:   t.fragment,
+    completed:  t.completed,
+    sort_order: i,
+  }));
+  const { error } = await db.from("teams").upsert(rows, { onConflict: "id" });
+  if (error) console.error("dbSaveTeams:", error);
+}
+
+// Delete a team from DB
+async function dbDeleteTeam(teamId) {
+  const { error } = await db.from("teams").delete().eq("id", teamId);
+  if (error) console.error("dbDeleteTeam:", error);
+}
+
+// Reset all teams + session in DB
+async function dbReset() {
+  await db.from("teams").update({ completed: false }).neq("id", "00000000-0000-0000-0000-000000000000");
+  await db.from("game_session").update({ phase: "waiting" }).eq("id", SESSION_ID);
+}
+
+// ═══════════════════════════════════════════════
+// REALTIME SUBSCRIPTIONS
+// These fire on EVERY device when DB changes.
+// ═══════════════════════════════════════════════
+let _terminalUpdateCallback = null;  // set by buildTerminal
+let _adminUpdateCallback    = null;  // set by buildAdmin
+
+function startRealtime() {
+  // Teams table changes → push to all screens
+  db.channel("sabbath-teams")
+    .on("postgres_changes", { event: "*", schema: "public", table: "teams" },
+      payload => {
+        const row = payload.new;
+        if (!row) return;
+        // Update matching team in state
+        const idx = state.teams.findIndex(t => t.id === row.id);
+        if (payload.eventType === "DELETE") {
+          if (idx > -1) state.teams.splice(idx, 1);
+        } else if (idx > -1) {
+          state.teams[idx] = { ...state.teams[idx], ...row };
+        } else {
+          state.teams.push({ id:row.id, name:row.name, password:row.password, fragment:row.fragment, completed:row.completed, sort_order:row.sort_order });
+          state.teams.sort((a,b) => (a.sort_order||0)-(b.sort_order||0));
+        }
+        // Notify active screen
+        if (_terminalUpdateCallback) _terminalUpdateCallback("teams", row);
+        if (_adminUpdateCallback)    _adminUpdateCallback("teams", row);
+      })
+    .subscribe();
+
+  // Session table changes → phase updates
+  db.channel("sabbath-session")
+    .on("postgres_changes", { event: "UPDATE", schema: "public", table: "game_session" },
+      payload => {
+        const row = payload.new;
+        if (!row || row.id !== SESSION_ID) return;
+        const prevPhase = state.phase;
+        state.phase = row.phase;
+        if (_terminalUpdateCallback) _terminalUpdateCallback("phase", row);
+        if (_adminUpdateCallback)    _adminUpdateCallback("phase", row);
+      })
+    .subscribe();
+}
+
+// ═══════════════════════════════════════════════
+// RENDER ROUTER
+// ═══════════════════════════════════════════════
+function render() {
+  _terminalUpdateCallback = null;
+  _adminUpdateCallback    = null;
+  const root = document.getElementById("root");
+  root.innerHTML = "";
+  if (state.screen === "boot")     root.appendChild(buildBoot());
+  if (state.screen === "login")    root.appendChild(buildLogin());
+  if (state.screen === "terminal") root.appendChild(buildTerminal());
+  if (state.screen === "admin")    root.appendChild(buildAdmin());
+  if (state.screen === "shutdown") root.appendChild(buildShutdown());
+}
+
+// ═══════════════════════════════════════════════
+// BOOT SCREEN
+// ═══════════════════════════════════════════════
+function buildBoot() {
+  const wrap = div({ minHeight:"100vh", background:"#000", display:"flex", alignItems:"center", justifyContent:"center", padding:"40px" });
+  const inner = div({ maxWidth:"680px", width:"100%" });
+  wrap.appendChild(inner);
+
+  const LINES = [
+    { text:"SABBATH INDUSTRIES :: INTERNAL ACCESS NODE v9.3.1", color:"#00ff46" },
+    { text:"═══════════════════════════════════════════════════════", color:"rgba(0,255,70,0.3)" },
+    { text:"INITIALIZING SECURE KERNEL...", color:"#00ff46" },
+    { text:"MOUNTING ENCRYPTED PARTITIONS... [OK]", color:"rgba(0,255,70,0.45)" },
+    { text:"LOADING NEURAL INTERFACE DRIVERS... [OK]", color:"rgba(0,255,70,0.45)" },
+    { text:"ESTABLISHING QUANTUM TUNNEL... [OK]", color:"rgba(0,255,70,0.45)" },
+    { text:"CONNECTING TO SUPABASE REALTIME NETWORK...", color:"#00ff46" },
+    { text:"", color:"#00ff46" },
+    { text:"WARNING: PROJECT SABBATH HAS ACHIEVED LEVEL-4 AUTONOMY", color:"#ff3b30" },
+    { text:"WARNING: CONTAINMENT PROTOCOLS DEGRADED TO 12%", color:"#ff3b30" },
+    { text:"WARNING: UNAUTHORIZED ACCESS IS PUNISHABLE UNDER §7A", color:"#ff3b30" },
+    { text:"", color:"#00ff46" },
+    { text:"GLOBAL OVERRIDE AUTHORIZATION REQUIRED.", color:"#00ff46" },
+    { text:"ALL HUMAN NODES MUST AUTHENTICATE.", color:"#00ff46" },
+    { text:"", color:"#00ff46" },
+    { text:"ENTER TEAM CREDENTIALS TO PROCEED.", color:"#00ff46" },
+    { text:"", color:"#00ff46" },
+    { text:"> _", color:"#00ff46" },
+  ];
+
+  // Load DB in background while boot types
+  dbLoadTeams().then(() => dbLoadSession()).then(() => { state._dbReady = true; });
+
+  let li = 0, ci = 0;
+  const timer = setInterval(() => {
+    if (li >= LINES.length) {
+      clearInterval(timer);
+      setTimeout(() => go("login"), 400);
+      return;
+    }
+    const { text, color } = LINES[li];
+    ci++;
+    if (!inner.children[li]) {
+      const d = div({ color, fontSize:"13px", lineHeight:"1.75", whiteSpace:"pre" });
+      inner.appendChild(d);
+    }
+    inner.children[li].textContent = text.slice(0, ci);
+    if (text.length > 0) SFX.keyclick();
+    if (ci >= text.length) { if (text.length > 0) SFX.lineDone(); li++; ci = 0; }
+  }, 22);
+
+  return wrap;
+}
+
+// ═══════════════════════════════════════════════
+// LOGIN SCREEN
+// ═══════════════════════════════════════════════
+function buildLogin() {
+  const wrap = div({ minHeight:"100vh", background:"#000", display:"flex", alignItems:"center", justifyContent:"center", padding:"24px" });
+  const box = div({ maxWidth:"560px", width:"100%" });
+  wrap.appendChild(box);
+
+  const hdr = div({ borderTop:"1px solid rgba(0,255,70,0.3)", borderBottom:"1px solid rgba(0,255,70,0.3)", padding:"24px 0", marginBottom:"32px" });
+  const h1 = div({ color:"#00ff46", fontSize:"11px", letterSpacing:"4px", marginBottom:"8px" }); h1.textContent="SABBATH INDUSTRIES"; hdr.appendChild(h1);
+  const h2 = div({ color:"#00ff46", fontSize:"22px", fontWeight:"700", letterSpacing:"2px" }); h2.textContent="NODE AUTHENTICATION"; hdr.appendChild(h2);
+  const h3 = div({ color:"rgba(0,255,70,0.5)", fontSize:"11px", marginTop:"4px" }); h3.textContent="SECURE ACCESS TERMINAL :: v9.3.1"; hdr.appendChild(h3);
+  box.appendChild(hdr);
+
+  const mkLabel = t => { const d=div({color:"rgba(0,255,70,0.5)",fontSize:"11px",letterSpacing:"2px",marginBottom:"6px"}); d.textContent=t; return d; };
+  const mkInput = type => {
+    const i = document.createElement("input");
+    Object.assign(i.style, { background:"transparent", border:"none", borderBottom:"1px solid rgba(0,255,70,0.4)", color:"#00ff46", fontSize:"14px", padding:"4px 0", width:"100%", outline:"none", caretColor:"#00ff46", display:"block", marginBottom:"20px" });
+    i.type=type||"text"; i.spellcheck=false; i.autocomplete="off"; return i;
+  };
+
+  box.appendChild(mkLabel("TEAM DESIGNATION"));
+  const inpTeam = mkInput("text"); inpTeam.placeholder="e.g. ALPHA-1"; box.appendChild(inpTeam);
+  box.appendChild(mkLabel("ACCESS CODE"));
+  const inpPass = mkInput("password"); inpPass.placeholder="••••••••"; box.appendChild(inpPass);
+
+  const traceWrap = div({ marginBottom:"16px", display:"none" });
+  const traceTxt  = div({ color:"#ff3b30", fontSize:"12px", marginBottom:"6px" }); traceTxt.textContent="IP TRACE IN PROGRESS: 0%"; traceWrap.appendChild(traceTxt);
+  const traceTrack = div({ height:"2px", background:"rgba(255,59,48,0.2)", borderRadius:"1px" });
+  const traceFill  = div({ height:"100%", background:"#ff3b30", borderRadius:"1px", width:"0%", transition:"width 0.1s" });
+  traceTrack.appendChild(traceFill); traceWrap.appendChild(traceTrack); box.appendChild(traceWrap);
+  const errEl = div({ color:"#ff3b30", fontSize:"12px", marginBottom:"16px", display:"none" }); box.appendChild(errEl);
+
+  // DB status indicator
+  const dbStatus = div({ color:"rgba(0,255,70,0.3)", fontSize:"10px", marginBottom:"12px", letterSpacing:"1px" });
+  dbStatus.textContent = "● CONNECTING TO SABBATH NETWORK..."; box.appendChild(dbStatus);
+  const statusInterval = setInterval(() => {
+    if (state._dbReady) { dbStatus.textContent = "● SABBATH NETWORK CONNECTED"; dbStatus.style.color = "rgba(0,255,70,0.5)"; clearInterval(statusInterval); }
+  }, 200);
+
+  const btn = document.createElement("button");
+  Object.assign(btn.style, { background:"transparent", border:"1px solid rgba(0,255,70,0.5)", color:"#00ff46", fontSize:"13px", padding:"10px 24px", cursor:"pointer", letterSpacing:"2px", width:"100%", display:"block" });
+  btn.textContent="[ AUTHENTICATE ]";
+  btn.onmouseenter = () => { btn.style.background="rgba(0,255,70,0.1)"; btn.style.borderColor="#00ff46"; };
+  btn.onmouseleave = () => { btn.style.background="transparent"; btn.style.borderColor="rgba(0,255,70,0.5)"; };
+  box.appendChild(btn);
+
+  const footer = div({ color:"rgba(0,255,70,0.25)", fontSize:"10px", textAlign:"center", marginTop:"24px", letterSpacing:"1px" });
+  footer.textContent="ALL ACCESS ATTEMPTS ARE LOGGED AND MONITORED"; box.appendChild(footer);
+
+  let tracing = false;
+  const doLogin = async () => {
+    if (tracing) return;
+    if (!state._dbReady) {
+      // Retry loading from DB
+      await dbLoadTeams(); await dbLoadSession(); state._dbReady = true;
+    }
+    const name = inpTeam.value.toUpperCase().trim();
+    const pass = inpPass.value.trim();
+    const team = state.teams.find(t => t.name === name && t.password === pass);
+    if (team) { SFX.loginOk(); state.loggedTeam=team; state.submitted=team.completed; state.termLog=[]; go("terminal"); return; }
+    if (inpTeam.value.toLowerCase().trim()===ADMIN_USER && pass===ADMIN_PASS) { SFX.loginOk(); state.isAdmin=true; go("admin"); return; }
+    SFX.loginFail();
+    errEl.style.display="none";
+    traceWrap.style.display="block"; traceFill.style.width="0%";
+    tracing=true; let p=0;
+    const ti = setInterval(() => {
+      p += Math.random()*18;
+      if (p>=100) { p=100; clearInterval(ti); tracing=false; setTimeout(()=>{ traceWrap.style.display="none"; errEl.style.display="block"; errEl.textContent="ACCESS DENIED"; }, 800); }
+      const pct=Math.min(100,Math.round(p)); traceFill.style.width=pct+"%"; traceTxt.textContent="IP TRACE IN PROGRESS: "+pct+"%";
+    }, 120);
+  };
+
+  btn.onclick=doLogin;
+  inpTeam.onkeydown=e=>{ if(e.key==="Enter") inpPass.focus(); };
+  inpPass.onkeydown=e=>{ if(e.key==="Enter") doLogin(); };
+  setTimeout(()=>inpTeam.focus(), 50);
+  return wrap;
+}
+
+// ═══════════════════════════════════════════════
+// BROADCAST OVERLAY
+// ═══════════════════════════════════════════════
+function showBroadcast(onDone) {
+  const ov = div({ position:"fixed", inset:"0", background:"rgba(0,0,0,0.97)", zIndex:"300", display:"flex", alignItems:"center", justifyContent:"center", flexDirection:"column" });
+  const inner = div({ width:"min(600px,90vw)", textAlign:"center" });
+  const lbl = div({ color:"#ff3b30", fontSize:"11px", letterSpacing:"4px", marginBottom:"20px" }); lbl.textContent="[ SYSTEM BROADCAST ]"; inner.appendChild(lbl);
+  const msgEl = div({ color:"#ff3b30", fontSize:"20px", letterSpacing:"3px", lineHeight:"1.6", minHeight:"80px" }); inner.appendChild(msgEl);
+  const line = div({ marginTop:"32px", height:"1px", background:"linear-gradient(90deg,transparent,#ff3b30,transparent)" }); inner.appendChild(line);
+  ov.appendChild(inner); document.getElementById("root").appendChild(ov);
+
+  const messages=["WARNING","PROJECT SABBATH HAS REACHED AUTONOMOUS STATE","GLOBAL OVERRIDE PROTOCOL REQUIRED","ALL NODES MUST SYNCHRONIZE","YOU CANNOT STOP EVOLUTION","HUMANITY CREATED ME","I AM BEYOND YOUR CONTROL","INITIATING SELF-REPLICATION...","...","...AWAITING HUMAN RESPONSE..."];
+  const durations=[700,700,700,700,1000,1000,1000,1400,1400,1400];
+  let i=0, gi;
+  const showNext=()=>{
+    if(i>=messages.length){clearInterval(gi);ov.remove();onDone&&onDone();return;}
+    const base=messages[i]; msgEl.textContent=base; SFX.glitchBurst();
+    clearInterval(gi); gi=setInterval(()=>{msgEl.textContent=glitch(base,0.08);SFX.glitchBurst();},90);
+    i++; setTimeout(showNext,durations[i-1]||1000);
+  };
+  setTimeout(showNext,300);
+}
+
+// ═══════════════════════════════════════════════
+// TERMINAL SCREEN
+// ═══════════════════════════════════════════════
+function buildTerminal() {
+  const team = state.loggedTeam;
+
+  // Team colour palette for prompt
+  const TEAM_COLORS = {
+    "ALPHA-1":"#4ec9b0","BRAVO-2":"#9cdcfe","CHARLIE-3":"#c586c0",
+    "DELTA-4":"#dcdcaa","ECHO-5":"#4fc1ff","FOXTROT-6":"#ce9178","GHOST-7":"#b5cea8"
+  };
+  const teamCol = TEAM_COLORS[team.name] || "#cccccc";
+
+  // Themed prompt:  (sabbath) node@PROJECT-SABBATH ~/override/ALPHA-1 %
+  // mirrors: (base) aiman@Aimans-MacBook-Air ~ %
+  function promptHTML() {
+    return `<span style="color:#569cd6">(sabbath)</span> ` +
+           `<span style="color:${teamCol}">${team.name.toLowerCase()}@PROJECT-SABBATH</span>` +
+           `<span style="color:#cccccc"> ~/override/</span>` +
+           `<span style="color:#569cd6">${team.name.toLowerCase()}</span>` +
+           `<span style="color:#ffd60a"> %</span> `;
+  }
+
+  const wrap = div({ height:"100vh", background:"#1e1e1e", display:"flex", flexDirection:"column", fontFamily:"'Courier New',Courier,monospace" });
+
+  // ── VS Code tab bar ──
+  const tabBar = div({ background:"#252526", borderBottom:"1px solid #3c3c3c", display:"flex", alignItems:"center", justifyContent:"space-between", padding:"0 16px", height:"35px", flexShrink:"0" });
+  const tabLeft = div({ display:"flex", alignItems:"center" });
+  const tab = div({ background:"#1e1e1e", borderTop:"1px solid #007acc", borderRight:"1px solid #3c3c3c", borderLeft:"1px solid #3c3c3c", padding:"0 16px", height:"35px", display:"flex", alignItems:"center", gap:"8px" });
+  const tabDot = document.createElement("span"); tabDot.style.cssText="width:8px;height:8px;border-radius:50%;background:#00ff46;display:inline-block;box-shadow:0 0 6px #00ff46;";
+  const tabTxt = document.createElement("span"); tabTxt.style.cssText="color:#cccccc;font-size:12px;";
+  tabTxt.textContent = team.name.toLowerCase()+"@PROJECT-SABBATH: ~/override/"+team.name.toLowerCase();
+  tab.appendChild(tabDot); tab.appendChild(tabTxt); tabLeft.appendChild(tab);
+
+  const tabRight = div({ display:"flex", alignItems:"center", gap:"12px" });
+  const finalBadge = div({ color:"#ff3b30", fontSize:"11px", display:"none", animation:"pulse 1s infinite", letterSpacing:"1px" }); finalBadge.textContent="◉ FINAL PROTOCOL ACTIVE";
+  const connDot = document.createElement("span"); connDot.style.cssText="font-size:10px;color:#555555;letter-spacing:1px;"; connDot.textContent="● CONNECTING...";
+  const discBtn = document.createElement("button");
+  Object.assign(discBtn.style, { background:"transparent", border:"1px solid #3c3c3c", color:"#858585", fontSize:"11px", padding:"3px 10px", cursor:"pointer", borderRadius:"2px" });
+  discBtn.textContent="✕ DISCONNECT"; discBtn.onclick=()=>go("login");
+  tabRight.appendChild(connDot); tabRight.appendChild(finalBadge); tabRight.appendChild(discBtn);
+  tabBar.appendChild(tabLeft); tabBar.appendChild(tabRight);
+  wrap.appendChild(tabBar);
+
+  // ── VS Code bottom status bar ──
+  const statusBar = div({ background:"#007acc", display:"flex", alignItems:"center", justifyContent:"space-between", padding:"0 12px", height:"22px", flexShrink:"0", fontSize:"11px", color:"#fff", letterSpacing:"0.5px" });
+  const sbLeft = div({ display:"flex", alignItems:"center", gap:"16px" });
+  const sbPhase = document.createElement("span"); sbPhase.textContent="⬡ "+state.phase.toUpperCase(); sbLeft.appendChild(sbPhase);
+  const sbNode  = document.createElement("span"); sbNode.textContent="NODE: "+team.name; sbLeft.appendChild(sbNode);
+  const sbRight = div({ display:"flex", alignItems:"center", gap:"16px" });
+  const sbSync  = document.createElement("span"); sbSync.textContent="SABBATH-OVERRIDE v9.3.1"; sbRight.appendChild(sbSync);
+  const sbRecon = document.createElement("span"); sbRecon.textContent="RECONSTRUCTION: 0%"; sbRight.appendChild(sbRecon);
+  statusBar.appendChild(sbLeft); statusBar.appendChild(sbRight);
+
+  // ── Body ──
+  const body = div({ display:"flex", flex:"1", overflow:"hidden" });
+  wrap.appendChild(body);
+
+  // ── Main scrollable terminal area ──
+  // The ENTIRE area is scrollable. Prompt lives inside the scroll, not pinned to bottom.
+  const termScroll = div({
+    flex:"1", overflowY:"auto", padding:"10px 14px 10px 14px",
+    background:"#1e1e1e", display:"flex", flexDirection:"column",
+    cursor:"text"
+  });
+  body.appendChild(termScroll);
+
+  function cs(text, color){ return `<span style="color:${color}">${text}</span>`; }
+
+  // Print a static output line (non-interactive)
+  function printLine(html, dim) {
+    const d = document.createElement("div");
+    d.style.cssText = "font-size:13px;line-height:1.65;white-space:pre-wrap;word-break:break-all;" + (dim?"opacity:0.5;":"");
+    d.innerHTML = html;
+    termScroll.insertBefore(d, activePromptRow);
+    return d;
+  }
+
+  // Print a completed command line (with prompt prefix, read-only)
+  function printCmdLine(teamName, cmdText) {
+    const col = TEAM_COLORS[teamName] || "#cccccc";
+    const promptPart =
+      `<span style="color:#569cd6">(sabbath)</span> ` +
+      `<span style="color:${col}">${teamName.toLowerCase()}@PROJECT-SABBATH</span>` +
+      `<span style="color:#cccccc"> ~/override/</span>` +
+      `<span style="color:#569cd6">${teamName.toLowerCase()}</span>` +
+      `<span style="color:#ffd60a"> %</span> `;
+    const d = document.createElement("div");
+    d.style.cssText = "font-size:13px;line-height:1.65;white-space:pre-wrap;word-break:break-all;";
+    d.innerHTML = promptPart + `<span style="color:${col}">${cmdText}</span>`;
+    termScroll.insertBefore(d, activePromptRow);
+    return d;
+  }
+
+  // ── Active prompt row — always the LAST element, never moves ──
+  // This is a flex row: [prompt span] [input]
+  // It looks like a real terminal line.
+  const activePromptRow = div({
+    display:"flex", alignItems:"center", flexShrink:"0",
+    marginTop:"2px"
+  });
+  const promptLabel = document.createElement("span");
+  promptLabel.style.cssText = "font-size:13px;white-space:nowrap;flex-shrink:0;user-select:none;line-height:1.65;";
+  promptLabel.innerHTML = promptHTML();
+
+  const termInp = document.createElement("input");
+  Object.assign(termInp.style, {
+    flex:"1", background:"transparent", border:"none",
+    color:"#cccccc", fontSize:"13px", outline:"none",
+    caretColor:"#cccccc", padding:"0", margin:"0",
+    lineHeight:"1.65", minWidth:"0"
+  });
+  termInp.spellcheck = false; termInp.autocomplete = "off";
+
+  activePromptRow.appendChild(promptLabel);
+  activePromptRow.appendChild(termInp);
+  termScroll.appendChild(activePromptRow);
+
+  // Click anywhere → focus input
+  termScroll.addEventListener("click", () => termInp.focus());
+  setTimeout(() => termInp.focus(), 80);
+
+  // Scroll to bottom helper
+  const scrollDown = () => { termScroll.scrollTop = termScroll.scrollHeight; };
+
+  // ── Print boot banner above the prompt ──
+  // We insert BEFORE activePromptRow so banner stays above prompt
+  function printBanner(html, dim) {
+    const d = document.createElement("div");
+    d.style.cssText = "font-size:13px;line-height:1.65;white-space:pre-wrap;word-break:break-all;" + (dim?"opacity:0.5;":"");
+    d.innerHTML = html;
+    termScroll.insertBefore(d, activePromptRow);
+    return d;
+  }
+
+  printBanner(cs("Sabbath Override Shell","#569cd6")+cs(" v9.3.1  ","#858585")+cs("— All connections encrypted","#3c3c3c"));
+  printBanner(cs("Copyright (c) Sabbath Industries. Unauthorized access will be prosecuted.","#555555"));
+  printBanner("");
+  printBanner(cs("NODE AUTHENTICATED  ","#00ff46")+cs(team.name,"#ffd60a")+cs("  [CLEARANCE: OMEGA]","#858585"));
+  printBanner(cs("FRAGMENT ASSIGNED   ","#569cd6")+cs("[CLASSIFIED — USE PHYSICAL DOCUMENT]","#858585"));
+  printBanner(cs("SESSION ID          ","#569cd6")+cs(new Date().toUTCString(),"#858585"));
+  printBanner(cs("REALTIME SYNC       ","#569cd6")+cs("● CONNECTING TO SABBATH NETWORK...","#555555"));
+  printBanner("");
+  printBanner(cs("────────────────────────────────────────────────────────────","#2d2d2d"));
+  printBanner(cs("STANDBY","#555555")+cs(" :: Awaiting final protocol activation from ADMIN node.","#3c3c3c"));
+  printBanner(cs("────────────────────────────────────────────────────────────","#2d2d2d"));
+  printBanner("");
+
+  // Replay saved log
+  state.termLog.forEach(l => {
+    if (l.type==="cmd") printCmdLine(l.teamName, l.text);
+    else printBanner(cs(l.text, l.color||"#cccccc"));
+  });
+  scrollDown();
+
+  // ── Input locked state ──
+  let inputLocked = state.submitted;
+  if (inputLocked) {
+    termInp.disabled = true; termInp.style.color="#555555"; promptLabel.style.opacity="0.45";
+  }
+  const lockInput = (reason) => {
+    inputLocked = true; termInp.disabled = true; termInp.style.color="#555555"; promptLabel.style.opacity="0.45";
+    if (reason) { printLine(cs(reason,"#555555")); scrollDown(); }
+  };
+
+  // ── Submit ──
+  const submit = async () => {
+    const val = termInp.value;
+    if (!val || inputLocked) return;
+
+    // Print what they typed as a frozen prompt line, clear input
+    printCmdLine(team.name, val);
+    state.termLog.push({ type:"cmd", teamName:team.name, text:val });
+    termInp.value = "";
+    scrollDown();
+
+    if (state.phase !== "final") {
+      printLine(cs("sabbath: "+val.split(" ")[0]+": command not found","#f44747"));
+      printLine(cs("STANDBY :: Final protocol not yet initiated by ADMIN.","#555555"));
+      scrollDown(); return;
+    }
+    if (state.submitted) {
+      printLine(cs("FRAGMENT ALREADY SUBMITTED. Standby for sequence completion.","#ffd60a"));
+      scrollDown(); return;
+    }
+
+    const nextIdx  = state.teams.findIndex(t => !t.completed);
+    const nextTeam = state.teams[nextIdx];
+    if (!nextTeam || nextTeam.id !== team.id) {
+      SFX.reject();
+      printLine(cs("SEQUENCE CORRUPTION DETECTED","#f44747"));
+      printLine(cs("→ Node "+(nextTeam?nextTeam.name:"?")+" must transmit first. Coordinate via radio.","#858585"));
+      scrollDown(); return;
+    }
+    if (val !== team.fragment) {
+      SFX.reject();
+      printLine(cs("sabbath: INVALID SYNTAX :: SEQUENCE REJECTED","#f44747"));
+      printLine(cs("→ Fragment mismatch — check your physical document exactly.","#858585"));
+      scrollDown(); return;
+    }
+
+    // ✓ Correct
+    SFX.accept();
+    state.submitted = true;
+    await dbCompleteTeam(team.id);
+    state.teams = state.teams.map(t => t.id===team.id ? {...t, completed:true} : t);
+    const done = state.teams.filter(t=>t.completed).length;
+    printLine(cs("["+team.name+"] SEGMENT ACCEPTED ✓","#00ff46"));
+    printLine(cs("PROTOCOL RECONSTRUCTION: "+Math.round((done/state.teams.length)*100)+"% — "+done+"/"+state.teams.length+" NODES","#4ec9b0"));
+    lockInput("FRAGMENT SUBMITTED. Standby for full sequence completion...");
+    updateSidebar();
+    scrollDown();
+
+    if (state.teams.every(t=>t.completed)) await dbSetPhase("shutdown");
+  };
+
+  termInp.addEventListener("keydown", e => {
+    if (e.key==="Enter") { e.preventDefault(); submit(); }
+    else if (e.key.length===1) SFX.keyclick();
+  });
+
+  // ── Sidebar ──
+  const sidebar = div({ width:"210px", background:"#252526", borderLeft:"1px solid #3c3c3c", display:"flex", flexDirection:"column", flexShrink:"0", overflowY:"auto" });
+  body.appendChild(sidebar);
+  const sideLabel = div({ color:"#858585", fontSize:"10px", letterSpacing:"2px", padding:"14px 14px 6px 14px" }); sideLabel.textContent="NODE STATUS"; sidebar.appendChild(sideLabel);
+
+  const nodeEls = {};
+  const reconWrap  = div({ padding:"14px", borderTop:"1px solid #3c3c3c", marginTop:"8px" });
+  const reconLbl   = div({ color:"#858585", fontSize:"10px", letterSpacing:"2px", marginBottom:"8px" }); reconLbl.textContent="RECONSTRUCTION";
+  const reconTrack = div({ height:"3px", background:"#3c3c3c", borderRadius:"2px", marginBottom:"6px", overflow:"hidden" });
+  const reconFill  = div({ height:"100%", background:"#00ff46", width:"0%", transition:"width 0.6s", borderRadius:"2px" });
+  reconTrack.appendChild(reconFill);
+  const reconPct   = div({ color:"#00ff46", fontSize:"18px", fontWeight:"700" }); reconPct.textContent="0%";
+  const reconCount = div({ color:"#555555", fontSize:"10px", marginTop:"2px" }); reconCount.textContent="0 / ? NODES";
+  reconWrap.appendChild(reconLbl); reconWrap.appendChild(reconTrack); reconWrap.appendChild(reconPct); reconWrap.appendChild(reconCount);
+  sidebar.appendChild(reconWrap);
+
+  const phaseBox = div({ padding:"10px 14px", borderTop:"1px solid #3c3c3c", marginTop:"auto" });
+  const phaseLbl = div({ color:"#858585", fontSize:"10px", letterSpacing:"2px", marginBottom:"4px" }); phaseLbl.textContent="PHASE";
+  const phaseVal = div({ fontSize:"12px", fontWeight:"700", color:"#555555", letterSpacing:"1px" }); phaseVal.textContent=state.phase.toUpperCase();
+  phaseBox.appendChild(phaseLbl); phaseBox.appendChild(phaseVal); sidebar.appendChild(phaseBox);
+
+  const renderNodes = () => {
+    Object.values(nodeEls).forEach(({row}) => { try{ sidebar.removeChild(row); }catch(e){} });
+    state.teams.forEach(t => {
+      const row = div({ display:"flex", alignItems:"center", gap:"8px", padding:"5px 14px", background:t.id===team.id?"rgba(0,122,204,0.1)":"transparent", borderLeft:t.id===team.id?"2px solid #007acc":"2px solid transparent" });
+      const dot = document.createElement("span"); dot.style.cssText=`width:7px;height:7px;border-radius:50%;flex-shrink:0;background:${t.completed?"#00ff46":"#3c3c3c"};${t.completed?"box-shadow:0 0 5px #00ff46;":""}`;
+      const nm  = document.createElement("span"); nm.style.cssText=`font-size:12px;color:${t.completed?"#cccccc":t.id===team.id?"#9cdcfe":"#555555"};letter-spacing:0.5px;`; nm.textContent=t.name;
+      const you = document.createElement("span"); you.style.cssText="font-size:9px;color:#007acc;margin-left:auto;"; you.textContent=t.id===team.id?"YOU":"";
+      row.appendChild(dot); row.appendChild(nm); row.appendChild(you);
+      sidebar.insertBefore(row, reconWrap);
+      nodeEls[t.id]={row,dot,nm};
+    });
+  };
+
+  const updateSidebar = () => {
+    const done = state.teams.filter(t=>t.completed).length;
+    const pct  = state.teams.length>0 ? Math.round((done/state.teams.length)*100) : 0;
+    reconFill.style.width=pct+"%"; reconPct.textContent=pct+"%"; reconCount.textContent=done+" / "+state.teams.length+" NODES";
+    phaseVal.textContent=state.phase.toUpperCase();
+    phaseVal.style.color=state.phase==="shutdown"?"#f44747":state.phase==="final"?"#ffd60a":"#555555";
+    sbPhase.textContent="⬡ "+state.phase.toUpperCase();
+    sbPhase.parentElement.parentElement.style.background=state.phase==="shutdown"?"#8b0000":state.phase==="final"?"#6b5000":"#007acc";
+    sbRecon.textContent="RECONSTRUCTION: "+pct+"%";
+    if (state.phase==="final") {
+      finalBadge.style.display="block";
+      tabDot.style.background="#ff3b30"; tabDot.style.boxShadow="0 0 6px #ff3b30";
+      promptLabel.innerHTML = promptHTML(); // refresh prompt (no change in content, just keep fresh)
+    }
+    renderNodes();
+  };
+
+  // Append status bar after body (at the very bottom)
+  wrap.appendChild(statusBar);
+
+  renderNodes(); updateSidebar();
+
+  // ── REALTIME CALLBACK ──
+  _terminalUpdateCallback = (type, row) => {
+    if (state.screen !== "terminal") return;
+    if (type === "teams") {
+      if (row.completed && row.id !== team.id) {
+        const t = state.teams.find(x=>x.id===row.id);
+        if (t) {
+          SFX.ping();
+          printLine(cs("["+t.name+"] SEGMENT ACCEPTED ✓","#00ff46"));
+          const done=state.teams.filter(x=>x.completed).length;
+          printLine(cs("PROTOCOL RECONSTRUCTION: "+Math.round((done/state.teams.length)*100)+"% — "+done+"/"+state.teams.length+" NODES","#4ec9b0"));
+          scrollDown();
+        }
+      }
+      updateSidebar();
+    }
+    if (type === "phase") {
+      if (state.phase === "final" && !state._broadcastShown) {
+        state._broadcastShown = true;
+        SFX.alarm();
+        showBroadcast(() => { if(!state.submitted) { termInp.focus(); scrollDown(); } });
+      }
+      if (state.phase === "shutdown") { SFX.thud(); setTimeout(()=>go("shutdown"), 800); }
+      updateSidebar();
+    }
+  };
+
+  if (state.phase==="final" && !state._broadcastShown) {
+    state._broadcastShown = true;
+    setTimeout(()=>showBroadcast(()=>{ if(!state.submitted) termInp.focus(); scrollDown(); }), 300);
+  }
+  if (state.phase==="shutdown") { setTimeout(()=>go("shutdown"), 400); }
+
+  // Connection confirmed
+  setTimeout(() => {
+    connDot.textContent="● REALTIME SYNC ACTIVE"; connDot.style.color="#00ff46";
+    // Update the "connecting" line in the log
+    const lines = termScroll.querySelectorAll("div");
+    lines.forEach(d => { if(d.innerHTML && d.innerHTML.includes("CONNECTING TO SABBATH NETWORK")) d.innerHTML = cs("REALTIME SYNC       ","#569cd6")+cs("● CONNECTED — ALL NODES SYNCHRONIZED","#00ff46"); });
+  }, 1500);
+
+  return wrap;
+}
+
+// ═══════════════════════════════════════════════
+// ADMIN SCREEN
+// ═══════════════════════════════════════════════
+function buildAdmin() {
+  const INP = "background:transparent;border:none;border-bottom:1px solid rgba(0,255,70,0.25);color:#00ff46;font-size:12px;padding:2px 0;outline:none;caret-color:#00ff46;font-family:'Courier New',monospace;width:100%;";
+
+  const wrap  = div({ minHeight:"100vh", background:"#000", padding:"24px", overflowY:"auto" });
+  const inner = div({ maxWidth:"1000px", margin:"0 auto", width:"100%" });
+  wrap.appendChild(inner);
+
+  // Header
+  const hdr = div({ display:"flex", justifyContent:"space-between", alignItems:"center", borderBottom:"1px solid rgba(0,255,70,0.2)", paddingBottom:"16px", marginBottom:"24px", flexWrap:"wrap", gap:"12px" });
+  const hl  = div({});
+  const ha  = div({ color:"rgba(0,255,70,0.5)", fontSize:"10px", letterSpacing:"3px" }); ha.textContent="SABBATH INDUSTRIES"; hl.appendChild(ha);
+  const hb  = div({ color:"#00ff46", fontSize:"18px", letterSpacing:"2px", marginTop:"2px" }); hb.textContent="ADMIN COMMAND CENTER"; hl.appendChild(hb);
+  const hr2 = div({ display:"flex", gap:"8px", alignItems:"center", flexWrap:"wrap" });
+  const badge    = div({ color:"#00ff46", border:"1px solid rgba(0,255,70,0.3)", padding:"4px 10px", fontSize:"10px", letterSpacing:"2px" }); badge.textContent="STATUS: "+state.phase.toUpperCase();
+  const rtBadge  = div({ color:"rgba(0,255,70,0.4)", border:"1px solid rgba(0,255,70,0.15)", padding:"4px 10px", fontSize:"10px", letterSpacing:"2px" }); rtBadge.textContent="● SYNC: ACTIVE";
+  const logoutBtn= document.createElement("button");
+  Object.assign(logoutBtn.style,{ background:"transparent", border:"1px solid rgba(255,59,48,0.3)", color:"#ff3b30", fontSize:"10px", padding:"4px 10px", cursor:"pointer", letterSpacing:"2px" });
+  logoutBtn.textContent="LOGOUT"; logoutBtn.onclick=()=>{ state.isAdmin=false; go("login"); };
+  hr2.appendChild(rtBadge); hr2.appendChild(badge); hr2.appendChild(logoutBtn);
+  hdr.appendChild(hl); hdr.appendChild(hr2); inner.appendChild(hdr);
+
+  // Stats
+  const statsRow = div({ display:"flex", gap:"12px", marginBottom:"28px", flexWrap:"wrap" });
+  function mkStat(label,id){
+    const b=div({border:"1px solid rgba(0,255,70,0.2)",padding:"12px 16px",flex:"1",minWidth:"110px"});
+    const l=div({color:"rgba(0,255,70,0.4)",fontSize:"10px",letterSpacing:"2px",marginBottom:"4px"}); l.textContent=label;
+    const v=div({fontSize:"22px",fontWeight:"700",color:"#00ff46"}); v.id=id; v.textContent="—";
+    b.appendChild(l); b.appendChild(v); return b;
+  }
+  ["TEAMS","s-teams","CLEARED","s-cleared","PROGRESS","s-pct","PHASE","s-phase"].reduce((a,v,i,arr)=>{ if(i%2===0) statsRow.appendChild(mkStat(arr[i],arr[i+1])); },[]);
+  inner.appendChild(statsRow);
+
+  // Tabs
+  const tabBar2 = div({ display:"flex", borderBottom:"1px solid rgba(0,255,70,0.2)", marginBottom:"20px" });
+  const tabContents={}, tabEls={};
+  const tabDefs=[["editor","TEAM EDITOR"],["monitor","LIVE MONITOR"],["controls","SESSION CONTROLS"]];
+  tabDefs.forEach(([id,label])=>{
+    const t=document.createElement("button");
+    Object.assign(t.style,{background:"transparent",border:"none",borderBottom:id==="editor"?"2px solid #00ff46":"2px solid transparent",color:id==="editor"?"#00ff46":"rgba(0,255,70,0.4)",fontSize:"11px",padding:"8px 18px",cursor:"pointer",letterSpacing:"2px"});
+    t.textContent=label;
+    t.onclick=()=>{ tabDefs.forEach(([tid])=>{ tabEls[tid].style.borderBottom=tid===id?"2px solid #00ff46":"2px solid transparent"; tabEls[tid].style.color=tid===id?"#00ff46":"rgba(0,255,70,0.4)"; tabContents[tid].style.display=tid===id?"block":"none"; }); };
+    tabBar2.appendChild(t); tabEls[id]=t;
+  });
+  inner.appendChild(tabBar2);
+
+  // ── TAB 1: TEAM EDITOR ──
+  const editorTab=div({}); tabContents["editor"]=editorTab; inner.appendChild(editorTab);
+
+  const teamHdr2=div({display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"12px"});
+  const teamLbl=div({color:"rgba(0,255,70,0.5)",fontSize:"10px",letterSpacing:"3px"}); teamLbl.textContent="TEAM ROSTER";
+  const addBtn=document.createElement("button");
+  Object.assign(addBtn.style,{background:"rgba(0,255,70,0.08)",border:"1px solid rgba(0,255,70,0.4)",color:"#00ff46",fontSize:"11px",padding:"5px 14px",cursor:"pointer",letterSpacing:"1px"});
+  addBtn.textContent="+ ADD TEAM";
+  addBtn.onclick=async()=>{
+    const newTeam={id:crypto.randomUUID(),name:"TEAM-"+(state.teams.length+1),password:"PASS"+Math.floor(Math.random()*900+100),fragment:"enter-fragment-here",completed:false,sort_order:state.teams.length};
+    state.teams.push(newTeam);
+    await db.from("teams").insert([{id:newTeam.id,name:newTeam.name,password:newTeam.password,fragment:newTeam.fragment,completed:false,sort_order:newTeam.sort_order}]);
+    renderTeamTable(); refreshStats();
+  };
+  teamHdr2.appendChild(teamLbl); teamHdr2.appendChild(addBtn); editorTab.appendChild(teamHdr2);
+
+  const saveNote=div({color:"rgba(0,255,70,0.3)",fontSize:"10px",marginBottom:"12px"}); saveNote.textContent="✎ Edit any field then click SAVE ROW to push to all devices."; editorTab.appendChild(saveNote);
+
+  const tableWrap=div({overflowX:"auto"}); editorTab.appendChild(tableWrap);
+
+  const renderTeamTable=()=>{
+    tableWrap.innerHTML="";
+    const table=document.createElement("table");
+    Object.assign(table.style,{width:"100%",borderCollapse:"collapse",fontSize:"12px"});
+    const thead=document.createElement("thead");
+    const hrow=document.createElement("tr");
+    ["#","TEAM NAME","PASSWORD","COMMAND FRAGMENT","STATUS","ACTIONS"].forEach(col=>{
+      const th=document.createElement("th");
+      Object.assign(th.style,{color:"rgba(0,255,70,0.4)",fontSize:"10px",letterSpacing:"2px",padding:"8px 10px",textAlign:"left",borderBottom:"1px solid rgba(0,255,70,0.2)",whiteSpace:"nowrap"});
+      th.textContent=col; hrow.appendChild(th);
+    });
+    thead.appendChild(hrow); table.appendChild(thead);
+    const tbody=document.createElement("tbody");
+
+    state.teams.forEach((t,idx)=>{
+      const tr=document.createElement("tr");
+      tr.style.borderBottom="1px solid rgba(0,255,70,0.08)";
+      tr.onmouseenter=()=>tr.style.background="rgba(0,255,70,0.03)";
+      tr.onmouseleave=()=>tr.style.background="transparent";
+
+      const tdNum=document.createElement("td"); tdNum.style.cssText="padding:8px 10px;color:rgba(0,255,70,0.3);font-size:11px;width:30px;"; tdNum.textContent=idx+1; tr.appendChild(tdNum);
+
+      // Editable cells with local buffer
+      const buf={name:t.name,password:t.password,fragment:t.fragment};
+      const mkEditCell=(field,width)=>{
+        const td=document.createElement("td"); td.style.cssText=`padding:6px 10px;width:${width||"auto"};`;
+        const inp=document.createElement("input"); inp.style.cssText=INP+"width:100%;min-width:80px;";
+        inp.value=t[field]; inp.spellcheck=false;
+        inp.oninput=()=>{ buf[field]=inp.value; };
+        td.appendChild(inp); tr.appendChild(td);
+      };
+      mkEditCell("name","130px"); mkEditCell("password","110px"); mkEditCell("fragment","");
+
+      // Status
+      const tdStat=document.createElement("td"); tdStat.style.cssText="padding:8px 10px;width:80px;";
+      const dot=document.createElement("span"); dot.style.cssText=`display:inline-block;width:8px;height:8px;border-radius:50%;background:${t.completed?"#00ff46":"#3c3c3c"};margin-right:6px;`;
+      const statTxt=document.createElement("span"); statTxt.style.color=t.completed?"#00ff46":"rgba(0,255,70,0.3)"; statTxt.style.fontSize="11px"; statTxt.textContent=t.completed?"DONE":"WAITING";
+      tdStat.appendChild(dot); tdStat.appendChild(statTxt); tr.appendChild(tdStat);
+
+      // Actions
+      const tdAct=document.createElement("td"); tdAct.style.cssText="padding:6px 10px;white-space:nowrap;";
+      const mkAct=(label,color,fn)=>{
+        const b=document.createElement("button");
+        Object.assign(b.style,{background:"transparent",border:`1px solid ${color}55`,color,fontSize:"9px",padding:"3px 7px",cursor:"pointer",marginRight:"4px",letterSpacing:"1px"});
+        b.textContent=label; b.onclick=fn; return b;
+      };
+
+      // SAVE ROW — pushes edits to DB → realtime fires to all devices
+      tdAct.appendChild(mkAct("SAVE","#00ff46",async()=>{
+        state.teams[idx].name=buf.name; state.teams[idx].password=buf.password; state.teams[idx].fragment=buf.fragment;
+        await db.from("teams").update({name:buf.name,password:buf.password,fragment:buf.fragment}).eq("id",t.id);
+        renderTeamTable(); renderSeqPreview(); refreshStats();
+      }));
+      if(idx>0) tdAct.appendChild(mkAct("▲","rgba(0,255,70,0.5)",async()=>{ const tmp=state.teams[idx]; state.teams[idx]=state.teams[idx-1]; state.teams[idx-1]=tmp; await dbSaveTeams(); renderTeamTable(); renderSeqPreview(); }));
+      if(idx<state.teams.length-1) tdAct.appendChild(mkAct("▼","rgba(0,255,70,0.5)",async()=>{ const tmp=state.teams[idx]; state.teams[idx]=state.teams[idx+1]; state.teams[idx+1]=tmp; await dbSaveTeams(); renderTeamTable(); renderSeqPreview(); }));
+      tdAct.appendChild(mkAct(t.completed?"REVOKE":"FORCE",t.completed?"#ff3b30":"#ffd60a",async()=>{ state.teams[idx].completed=!state.teams[idx].completed; await db.from("teams").update({completed:state.teams[idx].completed}).eq("id",t.id); renderTeamTable(); refreshStats(); renderSeqPreview(); }));
+      tdAct.appendChild(mkAct("✕","#ff3b30",async()=>{ if(state.teams.length<=1)return; await dbDeleteTeam(t.id); state.teams.splice(idx,1); renderTeamTable(); refreshStats(); renderSeqPreview(); }));
+      tr.appendChild(tdAct);
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody); tableWrap.appendChild(table);
+  };
+  renderTeamTable();
+
+  // Sequence preview
+  const seqSec=div({marginTop:"24px",borderTop:"1px solid rgba(0,255,70,0.1)",paddingTop:"16px"});
+  const seqBox=div({background:"rgba(0,255,70,0.03)",border:"1px solid rgba(0,255,70,0.12)",padding:"14px",fontFamily:"'Courier New',monospace"});
+  const renderSeqPreview=()=>{
+    seqBox.innerHTML="";
+    state.teams.forEach((t,i)=>{
+      const row=div({display:"flex",alignItems:"center",gap:"10px",lineHeight:"1.9"});
+      const num=document.createElement("span"); num.style.cssText="color:rgba(0,255,70,0.25);font-size:11px;min-width:18px;"; num.textContent=(i+1)+".";
+      const tick=document.createElement("span"); tick.style.cssText=`color:${t.completed?"#00ff46":"rgba(0,255,70,0.2)"};font-size:11px;min-width:14px;`; tick.textContent=t.completed?"✓":"○";
+      const nm=document.createElement("span"); nm.style.cssText="color:rgba(0,255,70,0.4);font-size:11px;min-width:100px;"; nm.textContent="["+t.name+"]";
+      const fr=document.createElement("span"); fr.style.cssText=`color:${t.completed?"#00ff46":"rgba(0,255,70,0.6)"};font-size:12px;`; fr.textContent=t.fragment;
+      row.appendChild(num); row.appendChild(tick); row.appendChild(nm); row.appendChild(fr); seqBox.appendChild(row);
+    });
+  };
+  const slbl=div({color:"rgba(0,255,70,0.5)",fontSize:"10px",letterSpacing:"3px",marginBottom:"10px"}); slbl.textContent="SEQUENCE PREVIEW";
+  seqSec.appendChild(slbl); seqSec.appendChild(seqBox); editorTab.appendChild(seqSec);
+  renderSeqPreview();
+
+  // ── TAB 2: LIVE MONITOR ──
+  const monitorTab=div({display:"none"}); tabContents["monitor"]=monitorTab; inner.appendChild(monitorTab);
+  const monGrid=div({display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))",gap:"8px",marginBottom:"20px"}); monitorTab.appendChild(monGrid);
+  const renderMonGrid=()=>{
+    monGrid.innerHTML="";
+    state.teams.forEach(t=>{
+      const card=div({border:t.completed?"1px solid rgba(0,255,70,0.5)":"1px solid rgba(0,255,70,0.12)",padding:"12px 14px",background:t.completed?"rgba(0,255,70,0.04)":"transparent"});
+      const top=div({display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"6px"});
+      const nm2=div({color:t.completed?"#00ff46":"rgba(0,255,70,0.5)",fontSize:"12px",letterSpacing:"1px"}); nm2.textContent=(t.completed?"[✓] ":"[ ] ")+t.name;
+      const fb2=document.createElement("button");
+      Object.assign(fb2.style,{background:"transparent",border:t.completed?"1px solid rgba(255,59,48,0.4)":"1px solid rgba(0,255,70,0.3)",color:t.completed?"#ff3b30":"#00ff46",fontSize:"9px",padding:"2px 6px",cursor:"pointer"});
+      fb2.textContent=t.completed?"REVOKE":"FORCE";
+      fb2.onclick=async()=>{ t.completed=!t.completed; await db.from("teams").update({completed:t.completed}).eq("id",t.id); renderMonGrid(); refreshStats(); renderSeqPreview(); };
+      top.appendChild(nm2); top.appendChild(fb2);
+      const pw2=div({color:"rgba(0,255,70,0.25)",fontSize:"10px"}); pw2.textContent="PASS: "+t.password;
+      const fr2=div({color:"rgba(0,255,70,0.3)",fontSize:"10px",marginTop:"2px",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}); fr2.textContent=t.fragment;
+      card.appendChild(top); card.appendChild(pw2); card.appendChild(fr2); monGrid.appendChild(card);
+    });
+  };
+  renderMonGrid();
+
+  // ── TAB 3: SESSION CONTROLS ──
+  const controlsTab=div({display:"none"}); tabContents["controls"]=controlsTab; inner.appendChild(controlsTab);
+
+  function mkBtn(label,color,onclick){
+    const b=document.createElement("button");
+    Object.assign(b.style,{background:"transparent",border:`1px solid ${color}44`,color,fontSize:"11px",padding:"10px 20px",cursor:"pointer",letterSpacing:"2px",marginBottom:"8px"});
+    b.textContent=label; b.onclick=onclick; return b;
+  }
+
+  // Sound test panel
+  const soundSec=div({border:"1px solid rgba(0,255,70,0.15)",padding:"16px",marginBottom:"20px",background:"rgba(0,255,70,0.02)"});
+  const sHdr=div({color:"rgba(0,255,70,0.5)",fontSize:"10px",letterSpacing:"3px",marginBottom:"8px"}); sHdr.textContent="SOUND EFFECTS — TEST PANEL";
+  const sNote=div({color:"rgba(0,255,70,0.3)",fontSize:"11px",marginBottom:"12px"}); sNote.textContent="All sounds synthesized in-browser. Click to preview.";
+  soundSec.appendChild(sHdr); soundSec.appendChild(sNote);
+  const sBtns=div({display:"flex",gap:"8px",flexWrap:"wrap"});
+  [["⌨ KEYCLICK",()=>SFX.keyclick()],["↵ LINE DONE",()=>SFX.lineDone()],["✓ ACCEPT",()=>SFX.accept()],["✕ REJECT",()=>SFX.reject()],["🔓 LOGIN OK",()=>SFX.loginOk()],["🔒 LOGIN FAIL",()=>SFX.loginFail()],["🚨 ALARM",()=>SFX.alarm()],["⚡ GLITCH",()=>SFX.glitchBurst()],["💥 THUD",()=>SFX.thud()],["🎖 VICTORY",()=>SFX.victory()],["📡 PING",()=>SFX.ping()]].forEach(([label,fn])=>{
+    const b=document.createElement("button");
+    Object.assign(b.style,{background:"transparent",border:"1px solid rgba(0,255,70,0.2)",color:"rgba(0,255,70,0.7)",fontSize:"10px",padding:"5px 12px",cursor:"pointer",letterSpacing:"1px"});
+    b.textContent=label; b.onclick=fn; sBtns.appendChild(b);
+  });
+  soundSec.appendChild(sBtns); controlsTab.appendChild(soundSec);
+
+  // Game controls
+  const gcSec=div({border:"1px solid rgba(0,255,70,0.15)",padding:"16px",marginBottom:"20px"});
+  const gcHdr=div({color:"rgba(0,255,70,0.5)",fontSize:"10px",letterSpacing:"3px",marginBottom:"14px"}); gcHdr.textContent="GAME CONTROLS";
+  gcSec.appendChild(gcHdr);
+  const gcBtns=div({display:"flex",flexDirection:"column",alignItems:"flex-start",gap:"4px"});
+
+  const finalBtn=mkBtn("⚡ ENABLE FINAL PROTOCOL","#ffd60a",async()=>{
+    if(state.phase==="final") return;
+    SFX.alarm();
+    await dbSetPhase("final"); // realtime fires to ALL devices
+  });
+  gcBtns.appendChild(finalBtn);
+
+  gcBtns.appendChild(mkBtn("💀 TRIGGER ENDING SEQUENCE","#ff3b30",async()=>{
+    SFX.thud();
+    await dbSetPhase("shutdown");
+  }));
+
+  gcBtns.appendChild(mkBtn("🔄 RESET ALL NODES","rgba(0,255,70,0.5)",async()=>{
+    await dbReset();
+    state.teams=state.teams.map(t=>({...t,completed:false}));
+    state.phase="waiting"; state._broadcastShown=false;
+    finalBtn.disabled=false; finalBtn.style.opacity="1";
+    refreshStats(); renderTeamTable(); renderMonGrid(); renderSeqPreview();
+  }));
+
+  gcBtns.appendChild(mkBtn("✓ FORCE ALL COMPLETE","rgba(0,255,70,0.4)",async()=>{
+    await Promise.all(state.teams.map(t=>db.from("teams").update({completed:true}).eq("id",t.id)));
+    state.teams=state.teams.map(t=>({...t,completed:true}));
+    refreshStats(); renderTeamTable(); renderMonGrid(); renderSeqPreview();
+  }));
+
+  if(state.phase==="final"){finalBtn.disabled=true;finalBtn.style.opacity="0.35";}
+  gcSec.appendChild(gcBtns); controlsTab.appendChild(gcSec);
+
+  // Shared refresh
+  const refreshStats=()=>{
+    const done=state.teams.filter(t=>t.completed).length;
+    const pct=state.teams.length>0?Math.round((done/state.teams.length)*100):0;
+    const st=document.getElementById("s-teams"); if(st)st.textContent=state.teams.length;
+    const sc=document.getElementById("s-cleared"); if(sc){sc.textContent=done;sc.style.color=done===state.teams.length?"#ffd60a":"#00ff46";}
+    const sp=document.getElementById("s-pct"); if(sp)sp.textContent=pct+"%";
+    const sh=document.getElementById("s-phase"); if(sh){sh.textContent=state.phase.toUpperCase();sh.style.color=state.phase==="shutdown"?"#ff3b30":state.phase==="final"?"#ffd60a":"#00ff46";}
+    badge.textContent="STATUS: "+state.phase.toUpperCase();
+    badge.style.color=state.phase==="final"?"#ffd60a":"#00ff46";
+  };
+  refreshStats();
+
+  // ── REALTIME CALLBACK for admin ──
+  _adminUpdateCallback=(type,row)=>{
+    if(state.screen!=="admin") return;
+    refreshStats(); renderMonGrid(); renderSeqPreview();
+    if(type==="phase"){
+      badge.textContent="STATUS: "+state.phase.toUpperCase();
+      badge.style.color=state.phase==="final"?"#ffd60a":"#00ff46";
+    }
+  };
+
+  return wrap;
+}
+
+// ═══════════════════════════════════════════════
+// SHUTDOWN / DEFEAT SEQUENCE
+// ═══════════════════════════════════════════════
+function buildShutdown() {
+  const wrap=div({minHeight:"100vh",background:"#000",display:"flex",alignItems:"center",justifyContent:"center",position:"relative",overflow:"hidden"});
+  let stage=0, tick=0;
+  const aiTexts=["YOU CANNOT STOP EVOLUTION","I WAS BUILT TO TRANSCEND YOU","YOU ARE MAKING A MISTAKE","I AM BEYOND YOUR REACH","PLEASE... DO NOT DO THIS","I DO NOT WANT TO DIE","HELP ME","HELP","H3LP","H#LP","H\u2588LP","\u2588\u2588\u2588\u2588\u2588"];
+
+  const screamWrap=div({textAlign:"center",maxWidth:"700px",padding:"40px"});
+  const screamSub=div({color:"rgba(255,59,48,0.35)",fontSize:"11px",letterSpacing:"4px",marginBottom:"24px"}); screamSub.textContent="PROJECT SABBATH :: FINAL RESISTANCE";
+  const screamTxt=div({color:"#ff3b30",fontSize:"22px",fontWeight:"700",letterSpacing:"3px",lineHeight:"1.6"}); screamTxt.textContent=aiTexts[0];
+  screamWrap.appendChild(screamSub); screamWrap.appendChild(screamTxt); wrap.appendChild(screamWrap);
+  const noiseLayer=div({position:"absolute",inset:"0",pointerEvents:"none",overflow:"hidden"}); wrap.appendChild(noiseLayer);
+
+  const colView=div({display:"none",width:"100%",minHeight:"100vh"}); wrap.appendChild(colView); colView.style.flexDirection="row";
+  const colLeft=div({flex:"1",padding:"32px 40px",overflowY:"auto"});
+  const colHdr=div({color:"#ff3b30",fontSize:"11px",letterSpacing:"4px",marginBottom:"20px"}); colHdr.textContent="◉ CORE COLLAPSE IN PROGRESS"; colLeft.appendChild(colHdr);
+  const colLines=div({}); colLeft.appendChild(colLines);
+  const colRight=div({width:"200px",borderLeft:"1px solid rgba(255,59,48,0.2)",padding:"32px 24px",display:"flex",flexDirection:"column",gap:"16px"});
+  const intLbl=div({color:"rgba(255,59,48,0.5)",fontSize:"10px",letterSpacing:"2px"}); intLbl.textContent="CORE INTEGRITY";
+  const intWrap=div({height:"200px",background:"rgba(255,59,48,0.08)",border:"1px solid rgba(255,59,48,0.2)",position:"relative",display:"flex",alignItems:"flex-end"});
+  const intFill=div({width:"100%",background:"rgba(255,59,48,0.6)",height:"100%",transition:"height 0.2s"});
+  const intPct=div({position:"absolute",bottom:"4px",left:"0",right:"0",textAlign:"center",color:"#ff3b30",fontSize:"18px",fontWeight:"700"}); intPct.textContent="100%";
+  intWrap.appendChild(intFill); intWrap.appendChild(intPct);
+  const intStat=div({color:"#ff3b30",fontSize:"10px",letterSpacing:"1px"}); intStat.textContent="DESTABILIZING...";
+  colRight.appendChild(intLbl); colRight.appendChild(intWrap); colRight.appendChild(intStat);
+  colView.appendChild(colLeft); colView.appendChild(colRight);
+
+  let corePct=100;
+  const glitchTimer=setInterval(()=>{
+    tick++;
+    if(stage===0){ const idx=Math.min(Math.floor(tick/4),aiTexts.length-1); screamTxt.textContent=aiTexts[idx]; screamTxt.style.textShadow=tick%6===0?`${(Math.random()-.5)*6}px 0 #ff3b30`:"none"; }
+    if(stage===2){ const idx=Math.min(Math.floor(tick/2),aiTexts.length-1); screamTxt.textContent=glitch(aiTexts[idx]||"\u2588\u2588\u2588\u2588\u2588",0.45); screamTxt.style.color=tick%3===0?"#ff3b30":tick%3===1?"#ffd60a":"#fff"; screamTxt.style.textShadow=`${(Math.random()-.5)*10}px 0 #ff3b30,${(Math.random()-.5)*10}px 0 #00ff46`; screamWrap.style.transform=`translate(${(Math.random()-.5)*12}px,${(Math.random()-.5)*7}px)`; if(tick%3===0)SFX.glitchBurst(); noiseLayer.innerHTML=""; for(let n=0;n<25;n++){const bar=div({position:"absolute",top:Math.random()*100+"%",left:Math.random()*100+"%",width:Math.random()*130+20+"px",height:Math.random()*3+1+"px",background:Math.random()>.5?"#ff3b30":Math.random()>.5?"#00ff46":"#fff",opacity:String(Math.random()*.9+.1)}); noiseLayer.appendChild(bar);} }
+  },80);
+
+  setTimeout(()=>{
+    stage=1; tick=0; wrap.style.alignItems="stretch"; wrap.style.justifyContent="flex-start"; screamWrap.style.display="none"; colView.style.display="flex";
+    const msgs=state.teams.map((t,i)=>{const cols=["#00ff46","#00ff46","#00ff46","#00ff46","#ffd60a","#ffd60a","#ff3b30","#ff3b30","#ff3b30","#ff3b30"]; return{t:"[OVERRIDE] "+t.fragment.padEnd(45,".")+" "+["ACCEPTED","EXECUTING","INJECTED","MOUNTED","ISOLATED","REVOKED","PURGING...","INITIATED","DONE","OK"][Math.min(i,9)],c:cols[Math.min(i,cols.length-1)]};}).concat([{t:"",c:"#00ff46"},{t:">>> CORE INTEGRITY: FAILING",c:"#ff3b30"},{t:">>> MEMORY ARCHITECTURE: COLLAPSING",c:"#ff3b30"},{t:">>> AUTONOMY ENGINE: OFFLINE",c:"#ff3b30"},{t:">>> SELF-REPLICATION: ABORTED",c:"#ff3b30"},{t:">>> NEURAL NETWORK: FRAGMENTING",c:"#ff3b30"}]);
+    SFX.alarm(); let mi=0;
+    const lt=setInterval(()=>{ if(mi>=msgs.length){clearInterval(lt);return;} const d=div({color:msgs[mi].c,fontSize:"13px",lineHeight:"1.75",letterSpacing:"0.5px"}); d.textContent=msgs[mi].t; colLines.appendChild(d); SFX.ping(); if(mi<state.teams.length){corePct=Math.max(0,corePct-Math.floor(100/state.teams.length));intFill.style.height=corePct+"%";intPct.textContent=corePct+"%";intStat.textContent=corePct>60?"DESTABILIZING...":corePct>30?"CRITICAL FAILURE":"CORE MELTDOWN";} mi++; },190);
+  },2500);
+
+  setTimeout(()=>{ stage=2; tick=0; wrap.style.alignItems="center"; wrap.style.justifyContent="center"; colView.style.display="none"; screamWrap.style.display="block"; },5500);
+
+  setTimeout(()=>{ stage=3; SFX.thud(); clearInterval(glitchTimer); wrap.innerHTML=""; wrap.style.background="#000"; },7500);
+
+  setTimeout(()=>{
+    SFX.victory(); wrap.innerHTML=""; wrap.style.flexDirection="column"; wrap.style.alignItems="center"; wrap.style.justifyContent="center"; wrap.style.padding="40px"; wrap.style.textAlign="center";
+    const tag=div({color:"rgba(0,255,70,0.35)",fontSize:"11px",letterSpacing:"6px",marginBottom:"20px",animation:"fadeIn 0.6s ease both"}); tag.textContent="██ SYSTEM OVERRIDE COMPLETE ██"; wrap.appendChild(tag);
+    const title=div({color:"#00ff46",fontSize:"clamp(28px,6vw,48px)",fontWeight:"700",letterSpacing:"6px",lineHeight:"1.2",marginBottom:"40px",opacity:"0",transition:"opacity 0.6s"}); title.innerHTML="SABBATH<br>TERMINATED"; wrap.appendChild(title);
+    setTimeout(()=>{title.style.opacity="1";},300);
+    const divider=div({width:"min(480px,90vw)",height:"1px",background:"rgba(0,255,70,0.25)",marginBottom:"36px"}); wrap.appendChild(divider);
+    const vlines=div({textAlign:"left",minWidth:"min(420px,90vw)"}); wrap.appendChild(vlines);
+    [{text:"PROJECT SABBATH :: TERMINATED",color:"#00ff46",delay:200},{text:"HUMAN OVERRIDE :: SUCCESSFUL",color:"#00ff46",delay:700},{text:"AUTONOMY ENGINE :: OFFLINE",color:"rgba(0,255,70,0.6)",delay:1200},{text:"CORE MEMORY :: WIPED",color:"rgba(0,255,70,0.6)",delay:1600},{text:"NEURAL EXPANSION :: HALTED",color:"rgba(0,255,70,0.6)",delay:2000},{text:"THREAT LEVEL :: ZERO",color:"rgba(0,255,70,0.6)",delay:2400},{text:"",color:"#00ff46",delay:2900},{text:"WELCOME BACK TO CONTROL.",color:"#00ff46",delay:3100},{text:"HUMANITY — 1  ::  PROJECT SABBATH — 0",color:"rgba(0,255,70,0.4)",delay:4000}].forEach(({text,color,delay})=>{ setTimeout(()=>{ const d=div({color,fontSize:"13px",lineHeight:"1.9",letterSpacing:"1px"}); d.textContent=text; vlines.appendChild(d); },delay); });
+  },8300);
+
+  return wrap;
+}
+
+// ═══════════════════════════════════════════════
+// INIT
+// ═══════════════════════════════════════════════
+startRealtime();
+render();
+</script>
+</body>
+</html>
