@@ -102,8 +102,35 @@ const SFX = (() => {
     loginOk(){ try{const ac=getCtx(),t=ac.currentTime;[440,554,659].forEach((f,i)=>tone(f,"sine",0.12,0.12,t+i*0.08,true));}catch(e){} },
     loginFail(){ try{const ac=getCtx(),t=ac.currentTime;tone(80,"sawtooth",0.3,0.2,t,true);noise(0.3,0.12,t);}catch(e){} },
     alarm(){ try{const ac=getCtx();let t=ac.currentTime;for(let i=0;i<6;i++){tone(880,"sawtooth",0.18,0.13,t,true);tone(660,"sawtooth",0.18,0.10,t+0.20,true);t+=0.40;}}catch(e){} },
-    glitchBurst(){ try{const ac=getCtx(),t=ac.currentTime;noise(0.06,0.15,t);tone(Math.random()*800+200,"sawtooth",0.05,0.10,t,true);}catch(e){} },
-    thud(){ try{const ac=getCtx(),t=ac.currentTime;tone(55,"sine",0.6,0.4,t,true);noise(0.3,0.2,t);}catch(e){} },
+    glitchBurst(){
+      try{
+        const ac=getCtx(), t=ac.currentTime;
+        // Layer 1: wide-band noise sweep through a resonant filter
+        const bufSize=ac.sampleRate*0.18;
+        const buf=ac.createBuffer(1,bufSize,ac.sampleRate);
+        const d=buf.getChannelData(0);
+        for(let i=0;i<bufSize;i++) d[i]=Math.random()*2-1;
+        const src=ac.createBufferSource(); src.buffer=buf;
+        const filt=ac.createBiquadFilter(); filt.type="peaking"; filt.frequency.setValueAtTime(400,t); filt.frequency.exponentialRampToValueAtTime(4000,t+0.14); filt.Q.value=8; filt.gain.value=18;
+        const g1=ac.createGain(); g1.gain.setValueAtTime(0.22,t); g1.gain.exponentialRampToValueAtTime(0.0001,t+0.18);
+        src.connect(filt); filt.connect(g1); g1.connect(ac.destination);
+        src.start(t); src.stop(t+0.19);
+        // Layer 2: rapid pitch-drop sawtooth — the "digital tear" tone
+        const osc=ac.createOscillator(); osc.type="sawtooth";
+        osc.frequency.setValueAtTime(1800+Math.random()*600,t);
+        osc.frequency.exponentialRampToValueAtTime(80+Math.random()*60,t+0.12);
+        const g2=ac.createGain(); g2.gain.setValueAtTime(0.18,t); g2.gain.exponentialRampToValueAtTime(0.0001,t+0.13);
+        osc.connect(g2); g2.connect(ac.destination); osc.start(t); osc.stop(t+0.14);
+        // Layer 3: short square bursts for the "stutter" effect
+        for(let i=0;i<4;i++){
+          const o2=ac.createOscillator(); o2.type="square";
+          o2.frequency.value=200+Math.random()*1600;
+          const g3=ac.createGain(); const bt=t+i*0.03;
+          g3.gain.setValueAtTime(0.10,bt); g3.gain.exponentialRampToValueAtTime(0.0001,bt+0.025);
+          o2.connect(g3); g3.connect(ac.destination); o2.start(bt); o2.stop(bt+0.03);
+        }
+      }catch(e){}
+    },
     victory(){ try{const ac=getCtx(),t=ac.currentTime;[220,277,330,440,554,659,880].forEach((f,i)=>tone(f,"sine",0.4,0.10,t+i*0.12,true));}catch(e){} },
     ping(){ try{const ac=getCtx(),t=ac.currentTime;tone(1200,"sine",0.06,0.06,t,true);}catch(e){} },
   };
@@ -262,13 +289,21 @@ function buildBoot() {
   ];
 
   // Load DB in background while boot types
-  dbLoadTeams().then(() => dbLoadSession()).then(() => { state._dbReady = true; });
+  dbLoadTeams().then(() => dbLoadSession()).then(() => {
+    state._dbReady = true;
+    // If game already won (phase=shutdown), go straight to victory after boot
+    if (state.phase === "shutdown") state._skipToVictory = true;
+  });
 
   let li = 0, ci = 0;
   const timer = setInterval(() => {
     if (li >= LINES.length) {
       clearInterval(timer);
-      setTimeout(() => go("login"), 400);
+      if (state._skipToVictory) {
+        setTimeout(() => go("shutdown"), 400);
+      } else {
+        setTimeout(() => go("login"), 400);
+      }
       return;
     }
     const { text, color } = LINES[li];
@@ -601,7 +636,7 @@ function buildTerminal() {
     updateSidebar();
     scrollDown();
 
-    if (state.teams.every(t=>t.completed)) await dbSetPhase("shutdown");
+    if (state.teams.every(t=>t.completed)) { state._freshShutdown = true; await dbSetPhase("shutdown"); }
   };
 
   termInp.addEventListener("keydown", e => {
@@ -687,7 +722,7 @@ function buildTerminal() {
         SFX.alarm();
         showBroadcast(() => { if(!state.submitted) { termInp.focus(); scrollDown(); } });
       }
-      if (state.phase === "shutdown") { SFX.thud(); setTimeout(()=>go("shutdown"), 800); }
+      if (state.phase === "shutdown") { state._freshShutdown = true; setTimeout(()=>go("shutdown"), 800); }
       updateSidebar();
     }
   };
@@ -916,7 +951,7 @@ function buildAdmin() {
   gcBtns.appendChild(finalBtn);
 
   gcBtns.appendChild(mkBtn("💀 TRIGGER ENDING SEQUENCE","#ff3b30",async()=>{
-    SFX.thud();
+    state._freshShutdown = true;
     await dbSetPhase("shutdown");
   }));
 
@@ -924,6 +959,7 @@ function buildAdmin() {
     await dbReset();
     state.teams=state.teams.map(t=>({...t,completed:false}));
     state.phase="waiting"; state._broadcastShown=false;
+    state._freshShutdown=false; state._skipToVictory=false;
     finalBtn.disabled=false; finalBtn.style.opacity="1";
     refreshStats(); renderTeamTable(); renderMonGrid(); renderSeqPreview();
   }));
@@ -968,6 +1004,43 @@ function buildAdmin() {
 // ═══════════════════════════════════════════════
 function buildShutdown() {
   const wrap=div({minHeight:"100vh",background:"#000",display:"flex",alignItems:"center",justifyContent:"center",position:"relative",overflow:"hidden"});
+
+  // ── Helper: render the final victory screen into wrap ──
+  function showVictory() {
+    wrap.innerHTML="";
+    wrap.style.cssText="min-height:100vh;background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px;text-align:center;";
+    SFX.victory();
+    const tag=div({color:"rgba(0,255,70,0.35)",fontSize:"11px",letterSpacing:"6px",marginBottom:"20px",animation:"fadeIn 0.6s ease both"});
+    tag.textContent="██ SYSTEM OVERRIDE COMPLETE ██"; wrap.appendChild(tag);
+    const title=div({color:"#00ff46",fontSize:"clamp(28px,6vw,48px)",fontWeight:"700",letterSpacing:"6px",lineHeight:"1.2",marginBottom:"40px",opacity:"0",transition:"opacity 0.6s"});
+    title.innerHTML="SABBATH<br>TERMINATED"; wrap.appendChild(title);
+    setTimeout(()=>{title.style.opacity="1";},300);
+    const divider=div({width:"min(480px,90vw)",height:"1px",background:"rgba(0,255,70,0.25)",marginBottom:"36px"}); wrap.appendChild(divider);
+    const vlines=div({textAlign:"left",minWidth:"min(420px,90vw)"}); wrap.appendChild(vlines);
+    [{text:"PROJECT SABBATH :: TERMINATED",color:"#00ff46",delay:200},
+     {text:"HUMAN OVERRIDE :: SUCCESSFUL",color:"#00ff46",delay:700},
+     {text:"AUTONOMY ENGINE :: OFFLINE",color:"rgba(0,255,70,0.6)",delay:1200},
+     {text:"CORE MEMORY :: WIPED",color:"rgba(0,255,70,0.6)",delay:1600},
+     {text:"NEURAL EXPANSION :: HALTED",color:"rgba(0,255,70,0.6)",delay:2000},
+     {text:"THREAT LEVEL :: ZERO",color:"rgba(0,255,70,0.6)",delay:2400},
+     {text:"",color:"#00ff46",delay:2900},
+     {text:"WELCOME BACK TO CONTROL.",color:"#00ff46",delay:3100},
+     {text:"HUMANITY — 1  ::  PROJECT SABBATH — 0",color:"rgba(0,255,70,0.4)",delay:4000},
+    ].forEach(({text,color,delay})=>{
+      setTimeout(()=>{ const d=div({color,fontSize:"13px",lineHeight:"1.9",letterSpacing:"1px"}); d.textContent=text; vlines.appendChild(d); },delay);
+    });
+  }
+
+  // ── If we arrived here via a REFRESH (phase was already shutdown in DB),
+  //    skip the whole animation and go straight to victory. ──
+  if (!state._freshShutdown) {
+    setTimeout(showVictory, 100);
+    return wrap;
+  }
+
+  // ── Otherwise run the full cinematic sequence ──
+  state._freshShutdown = false; // consumed
+
   let stage=0, tick=0;
   const aiTexts=["YOU CANNOT STOP EVOLUTION","I WAS BUILT TO TRANSCEND YOU","YOU ARE MAKING A MISTAKE","I AM BEYOND YOUR REACH","PLEASE... DO NOT DO THIS","I DO NOT WANT TO DIE","HELP ME","HELP","H3LP","H#LP","H\u2588LP","\u2588\u2588\u2588\u2588\u2588"];
 
@@ -1007,17 +1080,9 @@ function buildShutdown() {
 
   setTimeout(()=>{ stage=2; tick=0; wrap.style.alignItems="center"; wrap.style.justifyContent="center"; colView.style.display="none"; screamWrap.style.display="block"; },5500);
 
-  setTimeout(()=>{ stage=3; SFX.thud(); clearInterval(glitchTimer); wrap.innerHTML=""; wrap.style.background="#000"; },7500);
+  setTimeout(()=>{ stage=3; clearInterval(glitchTimer); wrap.innerHTML=""; wrap.style.background="#000"; },7500);
 
-  setTimeout(()=>{
-    SFX.victory(); wrap.innerHTML=""; wrap.style.flexDirection="column"; wrap.style.alignItems="center"; wrap.style.justifyContent="center"; wrap.style.padding="40px"; wrap.style.textAlign="center";
-    const tag=div({color:"rgba(0,255,70,0.35)",fontSize:"11px",letterSpacing:"6px",marginBottom:"20px",animation:"fadeIn 0.6s ease both"}); tag.textContent="██ SYSTEM OVERRIDE COMPLETE ██"; wrap.appendChild(tag);
-    const title=div({color:"#00ff46",fontSize:"clamp(28px,6vw,48px)",fontWeight:"700",letterSpacing:"6px",lineHeight:"1.2",marginBottom:"40px",opacity:"0",transition:"opacity 0.6s"}); title.innerHTML="SABBATH<br>TERMINATED"; wrap.appendChild(title);
-    setTimeout(()=>{title.style.opacity="1";},300);
-    const divider=div({width:"min(480px,90vw)",height:"1px",background:"rgba(0,255,70,0.25)",marginBottom:"36px"}); wrap.appendChild(divider);
-    const vlines=div({textAlign:"left",minWidth:"min(420px,90vw)"}); wrap.appendChild(vlines);
-    [{text:"PROJECT SABBATH :: TERMINATED",color:"#00ff46",delay:200},{text:"HUMAN OVERRIDE :: SUCCESSFUL",color:"#00ff46",delay:700},{text:"AUTONOMY ENGINE :: OFFLINE",color:"rgba(0,255,70,0.6)",delay:1200},{text:"CORE MEMORY :: WIPED",color:"rgba(0,255,70,0.6)",delay:1600},{text:"NEURAL EXPANSION :: HALTED",color:"rgba(0,255,70,0.6)",delay:2000},{text:"THREAT LEVEL :: ZERO",color:"rgba(0,255,70,0.6)",delay:2400},{text:"",color:"#00ff46",delay:2900},{text:"WELCOME BACK TO CONTROL.",color:"#00ff46",delay:3100},{text:"HUMANITY — 1  ::  PROJECT SABBATH — 0",color:"rgba(0,255,70,0.4)",delay:4000}].forEach(({text,color,delay})=>{ setTimeout(()=>{ const d=div({color,fontSize:"13px",lineHeight:"1.9",letterSpacing:"1px"}); d.textContent=text; vlines.appendChild(d); },delay); });
-  },8300);
+  setTimeout(showVictory, 8300);
 
   return wrap;
 }
